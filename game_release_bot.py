@@ -3,15 +3,15 @@ import requests
 import asyncio
 import aioschedule as schedule
 from datetime import datetime
-from telegram.ext import Application, CommandHandler
+from telegram.ext import Application, CommandHandler, PicklePersistence
 
-# --- НАСТРОЙКИ ---
+# --- НАСТРОЙКИ (будут браться с сервера) ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TWITCH_CLIENT_ID = os.environ.get('TWITCH_CLIENT_ID')
 TWITCH_CLIENT_SECRET = os.environ.get('TWITCH_CLIENT_SECRET')
-CHAT_ID_FILE = 'chat_id.txt'
+PORT = int(os.environ.get('PORT', 10000)) # Используем порт, предоставляемый Railway
 
-# --- ВСЕ ФУНКЦИИ БОТА ---
+# --- IGDB API ---
 def get_igdb_access_token():
     url = f'https://id.twitch.tv/oauth2/token?client_id={TWITCH_CLIENT_ID}&client_secret={TWITCH_CLIENT_SECRET}&grant_type=client_credentials'
     response = requests.post(url)
@@ -31,11 +31,13 @@ def get_upcoming_significant_games(access_token):
     response.raise_for_status()
     return response.json()
 
+# --- Логика бота ---
 async def start(update, context):
     chat_id = update.message.chat_id
-    with open(CHAT_ID_FILE, 'w') as f:
-        f.write(str(chat_id))
-    await update.message.reply_text('Отлично! Я запомнил этот чат и теперь буду присылать сюда уведомления о выходе игр. 🎮')
+    context.chat_data['chat_id'] = chat_id # Сохраняем chat_id в контексте бота
+    await update.message.reply_text(
+        'Отлично! Я запомнил этот чат и теперь буду присылать сюда уведомления о выходе игр. 🎮'
+    )
     print(f"Бот был активирован в чате с ID: {chat_id}")
 
 def format_game_message(game):
@@ -60,11 +62,15 @@ async def send_telegram_message(bot, chat_id, message, photo_url):
 
 async def check_for_game_releases(bot):
     print(f"[{datetime.now()}] Проверка выхода новых игр...")
-    if not os.path.exists(CHAT_ID_FILE):
+    
+    # Получаем сохраненный chat_id из хранилища бота
+    persistence_manager = bot.application.persistence
+    chat_id = persistence_manager.chat_data.get('chat_id')
+    
+    if not chat_id:
         print("Бот еще не был активирован. Пропускаю.")
         return
-    with open(CHAT_ID_FILE, 'r') as f:
-        chat_id = f.read().strip()
+        
     try:
         access_token = get_igdb_access_token()
         games = get_upcoming_significant_games(access_token)
@@ -79,19 +85,35 @@ async def check_for_game_releases(bot):
     except Exception as e:
         print(f"Произошла ошибка при проверке игр: {e}")
 
-async def scheduler(application):
-    bot = application.bot
+# --- Планировщик ---
+async def scheduler(bot):
     schedule.every().day.at("10:00").do(check_for_game_releases, bot=bot)
     print("Расписание настроено: проверка каждый день в 10:00.")
     while True:
         await schedule.run_pending()
         await asyncio.sleep(1)
 
-def main():
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(scheduler).build()
+# --- Основная функция запуска бота ---
+async def main():
+    # Используем PicklePersistence для сохранения данных между перезапусками
+    persistence = PicklePersistence(filepath='bot_data.pkl')
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).persistence(persistence).build()
+    
+    # Добавляем обработчик команды /start
     application.add_handler(CommandHandler("start", start))
+    
+    # Запускаем планировщик как фоновую задачу
+    asyncio.create_task(scheduler(application.bot))
+    
     print("Бот запущен и ждет команды /start...")
-    application.run_polling()
+    
+    # Запускаем бота в режиме веб-хуков
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=f"/{TELEGRAM_BOT_TOKEN}",
+        webhook_url=f"https://{os.environ.get('RAILWAY_STATIC_URL')}/{TELEGRAM_BOT_TOKEN}"
+    )
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
