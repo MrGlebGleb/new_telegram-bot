@@ -4,7 +4,6 @@ import asyncio
 import aioschedule as schedule
 from datetime import datetime
 from telegram.ext import Application, CommandHandler, PicklePersistence
-from telegram.ext.updater import Updater
 
 # --- НАСТРОЙКИ (будут браться с сервера) ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -107,10 +106,9 @@ async def main():
     
     application.add_handler(CommandHandler("start", start))
     
-    # Запускаем планировщик как фоновую задачу
-    asyncio.create_task(scheduler_task(application.bot))
-    
     print("Бот запущен и ждет команды /start...")
+    
+    asyncio.create_task(scheduler_task(application.bot))
     
     await application.run_webhook(
         listen="0.0.0.0",
