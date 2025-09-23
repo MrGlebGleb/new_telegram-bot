@@ -8,14 +8,14 @@ import requests
 import asyncio
 from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
-from telegram import constants
+from telegram import constants, Update
 from telegram.ext import (
     Application,
     CommandHandler,
     PicklePersistence,
     ContextTypes,
+    filters,
 )
-# --- НОВЫЙ ИМПОРТ ---
 from deep_translator import MyMemoryTranslator
 
 # --- CONFIG (from env) ---
@@ -30,23 +30,21 @@ if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
     raise RuntimeError("TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET must be set")
 
 
-# --- НОВАЯ ФУНКЦИЯ ПЕРЕВОДА ---
+# --- Translation helper ---
 def translate_text_blocking(text: str) -> str:
-    """Переводит текст на русский с помощью MyMemory API."""
     if not text:
         return ""
     try:
-        # Автоматически определяет исходный язык и переводит на русский ('ru')
         translated_text = MyMemoryTranslator(source="auto", target="ru").translate(text)
-        # Иногда API возвращает None, если не может перевести
         return translated_text if translated_text else text
     except Exception as e:
         print(f"[ERROR] MyMemory translation failed: {e}")
-        return text # В случае ошибки возвращаем оригинальный текст
+        return text
 
 
 # --- IGDB helpers (blocking) ---
 def _get_igdb_access_token_blocking():
+    # ... (код этой функции не меняется)
     url = (
         "https://id.twitch.tv/oauth2/token"
         f"?client_id={TWITCH_CLIENT_ID}"
@@ -57,8 +55,8 @@ def _get_igdb_access_token_blocking():
     r.raise_for_status()
     return r.json()["access_token"]
 
-
 def _get_upcoming_significant_games_blocking(access_token):
+    # ... (код этой функции не меняется)
     today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     today_ts = int(today_start.timestamp())
     headers = {"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {access_token}"}
@@ -73,36 +71,79 @@ def _get_upcoming_significant_games_blocking(access_token):
     return r.json()
 
 
+# --- Shared logic for sending releases ---
+async def send_releases_to_chat(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Fetches and sends game releases to a specific chat."""
+    app: Application = context.application
+    try:
+        access_token = await asyncio.to_thread(_get_igdb_access_token_blocking)
+        games = await asyncio.to_thread(_get_upcoming_significant_games_blocking, access_token)
+    except Exception as e:
+        print(f"[ERROR] IGDB request failed for chat {chat_id}: {e}")
+        await app.bot.send_message(chat_id=chat_id, text="Не удалось получить данные о релизах. Попробуйте позже.")
+        return
+
+    if not games:
+        await app.bot.send_message(chat_id=chat_id, text="🎮 Значимых релизов сегодня не найдено.")
+        return
+
+    for game in games:
+        if game.get("summary"):
+            game["summary"] = await asyncio.to_thread(translate_text_blocking, game["summary"])
+            
+        text, cover = _format_game_message(game)
+        await _send_to_chat(app, chat_id, text, cover)
+        await asyncio.sleep(0.8)
+
+
 # --- telegram handlers ---
-async def start_command(update, context: ContextTypes.DEFAULT_TYPE):
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Register chat for notifications."""
-    chat_id = update.effective_chat.id
-    chat_ids = context.bot_data.get("chat_ids")
-    if chat_ids is None:
-        chat_ids = []
-        context.bot_data["chat_ids"] = chat_ids
+    chat = update.effective_chat
+    bot_username = context.bot.username
+    
+    # В групповом чате проверяем, было ли упоминание бота
+    if chat.type in [chat.GROUP, chat.SUPERGROUP]:
+        # Сообщение должно начинаться с упоминания бота
+        if not update.message.text.startswith(f"@{bot_username}"):
+            print(f"[INFO] Ignoring /start in group {chat.id} without mention.")
+            return
+
+    chat_id = chat.id
+    chat_ids = context.bot_data.setdefault("chat_ids", [])
 
     if chat_id not in chat_ids:
         chat_ids.append(chat_id)
-    await update.message.reply_text(
-        "✅ Ок, я запомнил этот чат и буду присылать сюда уведомления о значимых релизах игр."
-    )
-    print(f"[INFO] Registered chat_id {chat_id}")
+        await update.message.reply_text(
+            "✅ Ок, я запомнил этот чат и буду присылать сюда ежедневные уведомления о релизах."
+        )
+        print(f"[INFO] Registered chat_id {chat_id}")
+    else:
+        await update.message.reply_text(
+            "Этот чат уже есть в списке рассылки."
+        )
+
+# --- НОВЫЙ ОБРАБОТЧИК ---
+async def releases_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """On-demand check for today's releases."""
+    chat_id = update.effective_chat.id
+    await update.message.reply_text("🔍 Ищу сегодняшние релизы...")
+    await send_releases_to_chat(chat_id, context)
 
 
 def _format_game_message(game: dict):
+    # ... (код этой функции не меняется)
     name = game.get("name", "Без названия")
     summary = game.get("summary", "Описание отсутствует.")
     cover = game.get("cover", {}).get("url")
     if cover:
-        # Запрашиваем изображение высокого разрешения
         cover = "https:" + cover.replace("t_thumb", "t_1080p")
 
     platforms = ", ".join([p["name"] for p in game.get("platforms", [])])
     
     steam_url = None
     for site in game.get("websites", []):
-        if site.get("category") == 13:  # 13 is the category for Steam
+        if site.get("category") == 13:
             steam_url = site.get("url")
             break
 
@@ -117,8 +158,8 @@ def _format_game_message(game: dict):
         
     return text, cover
 
-
 async def _send_to_chat(app: Application, chat_id: int, text: str, photo_url: str | None):
+    # ... (код этой функции не меняется)
     try:
         if photo_url:
             await app.bot.send_photo(chat_id=chat_id, photo=photo_url, caption=text, parse_mode=constants.ParseMode.MARKDOWN)
@@ -130,40 +171,21 @@ async def _send_to_chat(app: Application, chat_id: int, text: str, photo_url: st
         return False
 
 
-# --- job that will be scheduled by JobQueue (runs inside asyncio loop) ---
-async def check_for_game_releases(context: ContextTypes.DEFAULT_TYPE):
-    """JobQueue callback. Uses asyncio.to_thread to call blocking requests."""
-    app: Application = context.application
-    print(f"[{datetime.now().isoformat()}] Running scheduled check_for_game_releases")
-
-    chat_ids = app.bot_data.get("chat_ids") or []
+# --- job that will be scheduled by JobQueue ---
+async def daily_check_job(context: ContextTypes.DEFAULT_TYPE):
+    """JobQueue callback that sends releases to all registered chats."""
+    print(f"[{datetime.now().isoformat()}] Running scheduled daily_check_job")
+    chat_ids = context.bot_data.get("chat_ids", [])
     if not chat_ids:
-        print("[INFO] No registered chats; skipping.")
+        print("[INFO] No registered chats; skipping daily job.")
         return
-
-    try:
-        access_token = await asyncio.to_thread(_get_igdb_access_token_blocking)
-        games = await asyncio.to_thread(_get_upcoming_significant_games_blocking, access_token)
-    except Exception as e:
-        print(f"[ERROR] IGDB request failed: {e}")
-        return
-
-    if not games:
-        print("[INFO] No significant releases found today.")
-        return
-
-    for game in games:
-        # Переводим описание
-        if game.get("summary"):
-            game["summary"] = await asyncio.to_thread(translate_text_blocking, game["summary"])
-            
-        text, cover = _format_game_message(game)
-        for cid in chat_ids:
-            await _send_to_chat(app, cid, text, cover)
-        await asyncio.sleep(0.8)
+    
+    print(f"[INFO] Sending daily releases to {len(chat_ids)} chats.")
+    for chat_id in chat_ids:
+        await send_releases_to_chat(chat_id, context)
 
 
-# --- main builder (synchronous) ---
+# --- main builder ---
 def build_and_run():
     persistence = PicklePersistence(filepath="bot_data.pkl")
     application = (
@@ -173,20 +195,22 @@ def build_and_run():
         .build()
     )
 
-    application.add_handler(CommandHandler("start", start_command))
+    # handlers
+    # Регистрируем /start. Фильтр нужен, чтобы бот не реагировал на команду в чужом сообщении в группе.
+    application.add_handler(CommandHandler("start", start_command, filters.COMMAND))
+    # --- РЕГИСТРАЦИЯ НОВОЙ КОМАНДЫ ---
+    application.add_handler(CommandHandler("releases", releases_command))
 
+    # Schedule
     tz = ZoneInfo("Europe/Amsterdam")
     scheduled_time = time(hour=10, minute=0, tzinfo=tz)
-    application.job_queue.run_daily(check_for_game_releases, scheduled_time, name="daily_game_check")
+    application.job_queue.run_daily(daily_check_job, scheduled_time, name="daily_game_check")
 
-    async def startup_run(context):
-        await asyncio.sleep(2)
-        await check_for_game_releases(context)
-
-    application.job_queue.run_once(startup_run, when=5)
+    # Optional: Run once on startup
+    application.job_queue.run_once(lambda ctx: releases_command(Update(0), ctx), when=5)
 
     print("[INFO] Starting bot (run_polling). Registered handlers and jobs.")
-    application.run_polling(stop_signals=None)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
