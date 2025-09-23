@@ -4,6 +4,7 @@ import asyncio
 import aioschedule as schedule
 from datetime import datetime
 from telegram.ext import Application, CommandHandler, PicklePersistence
+from telegram.ext.updater import Updater
 
 # --- НАСТРОЙКИ (будут браться с сервера) ---
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -101,19 +102,16 @@ async def scheduler_task(bot):
 # --- Основная функция запуска бота ---
 async def main():
     """Основная точка входа для запуска бота с веб-хуками."""
-    # Используем PicklePersistence для сохранения данных между перезапусками
     persistence = PicklePersistence(filepath='bot_data.pkl')
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).persistence(persistence).build()
     
-    # Добавляем обработчик команды /start
     application.add_handler(CommandHandler("start", start))
-    
-    print("Бот запущен и ждет команды /start...")
     
     # Запускаем планировщик как фоновую задачу
     asyncio.create_task(scheduler_task(application.bot))
     
-    # Запускаем веб-сервер и слушаем входящие обновления
+    print("Бот запущен и ждет команды /start...")
+    
     await application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
