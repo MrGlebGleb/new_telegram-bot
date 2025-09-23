@@ -9,7 +9,7 @@ from telegram.ext import Application, CommandHandler, PicklePersistence
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TWITCH_CLIENT_ID = os.environ.get('TWITCH_CLIENT_ID')
 TWITCH_CLIENT_SECRET = os.environ.get('TWITCH_CLIENT_SECRET')
-PORT = int(os.environ.get('PORT', 10000)) # Используем порт, предоставляемый Railway
+PORT = int(os.environ.get('PORT', 10000))
 
 # --- IGDB API ---
 def get_igdb_access_token():
@@ -34,7 +34,7 @@ def get_upcoming_significant_games(access_token):
 # --- Логика бота ---
 async def start(update, context):
     chat_id = update.message.chat_id
-    context.chat_data['chat_id'] = chat_id # Сохраняем chat_id в контексте бота
+    context.chat_data['chat_id'] = chat_id
     await update.message.reply_text(
         'Отлично! Я запомнил этот чат и теперь буду присылать сюда уведомления о выходе игр. 🎮'
     )
@@ -62,8 +62,6 @@ async def send_telegram_message(bot, chat_id, message, photo_url):
 
 async def check_for_game_releases(bot):
     print(f"[{datetime.now()}] Проверка выхода новых игр...")
-    
-    # Получаем сохраненный chat_id из хранилища бота
     persistence_manager = bot.application.persistence
     chat_id = persistence_manager.chat_data.get('chat_id')
     
@@ -95,24 +93,20 @@ async def scheduler(bot):
 
 # --- Основная функция запуска бота ---
 async def main():
-    # Используем PicklePersistence для сохранения данных между перезапусками
     persistence = PicklePersistence(filepath='bot_data.pkl')
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).persistence(persistence).build()
     
-    # Добавляем обработчик команды /start
     application.add_handler(CommandHandler("start", start))
     
-    # Запускаем планировщик как фоновую задачу
-    asyncio.create_task(scheduler(application.bot))
-    
-    print("Бот запущен и ждет команды /start...")
-    
-    # Запускаем бота в режиме веб-хуков
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=f"/{TELEGRAM_BOT_TOKEN}",
-        webhook_url=f"https://{os.environ.get('RAILWAY_STATIC_URL')}/{TELEGRAM_BOT_TOKEN}"
+    # Теперь обе асинхронные задачи запускаются в одном цикле.
+    await asyncio.gather(
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=f"/{TELEGRAM_BOT_TOKEN}",
+            webhook_url=f"https://{os.environ.get('RAILWAY_STATIC_URL')}/{TELEGRAM_BOT_TOKEN}"
+        ),
+        scheduler(application.bot)
     )
 
 if __name__ == "__main__":
