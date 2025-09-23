@@ -6,12 +6,13 @@ Game release Telegram bot (clean rewrite).
 import os
 import requests
 import asyncio
-from datetime import datetime, time, timezone # <--- ИЗМЕНЕНИЕ ЗДЕСЬ
+from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
 from telegram import constants, Update
 from telegram.ext import (
     Application,
     CommandHandler,
+    MessageHandler, # <-- Добавили MessageHandler
     PicklePersistence,
     ContextTypes,
     filters,
@@ -43,6 +44,7 @@ def translate_text_blocking(text: str) -> str:
 
 # --- IGDB helpers (blocking) ---
 def _get_igdb_access_token_blocking():
+    # ... (код этой функции не меняется)
     url = (
         "https://id.twitch.tv/oauth2/token"
         f"?client_id={TWITCH_CLIENT_ID}"
@@ -53,9 +55,8 @@ def _get_igdb_access_token_blocking():
     r.raise_for_status()
     return r.json()["access_token"]
 
-
 def _get_upcoming_significant_games_blocking(access_token):
-    # --- ИЗМЕНЕНИЕ ЗДЕСЬ (исправляем предупреждение) ---
+    # ... (код этой функции не меняется)
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     today_ts = int(today_start.timestamp())
     headers = {"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {access_token}"}
@@ -63,7 +64,6 @@ def _get_upcoming_significant_games_blocking(access_token):
         "fields name, summary, cover.url, first_release_date, platforms.name, websites.url, websites.category;"
         f"where first_release_date >= {today_ts} & first_release_date < {today_ts + 86400}"
         " & cover != null & hypes > 5;"
-        # --- ГЛАВНОЕ ИСПРАВЛЕНИЕ ЗДЕСЬ (убираем '=') ---
         "sort hypes desc; limit 5;"
     )
     r = requests.post("https://api.igdb.com/v4/games", headers=headers, data=body, timeout=20)
@@ -73,6 +73,7 @@ def _get_upcoming_significant_games_blocking(access_token):
 
 # --- Shared logic for sending releases ---
 async def send_releases_to_chat(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    # ... (код этой функции не меняется)
     app: Application = context.application
     try:
         access_token = await asyncio.to_thread(_get_igdb_access_token_blocking)
@@ -95,12 +96,38 @@ async def send_releases_to_chat(chat_id: int, context: ContextTypes.DEFAULT_TYPE
 
 
 # --- Telegram Handlers ---
+
+# --- НОВЫЙ ОБРАБОТЧИК ---
+async def new_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Greets when the bot is added to a group and subscribes the group."""
+    new_members = update.message.new_chat_members
+    bot_id = context.bot.id
+    chat_id = update.effective_chat.id
+
+    # Проверяем, был ли добавлен в чат именно наш бот
+    for member in new_members:
+        if member.id == bot_id:
+            print(f"[INFO] Bot added to group {chat_id}. Subscribing.")
+            chat_ids = context.bot_data.setdefault("chat_ids", [])
+            if chat_id not in chat_ids:
+                chat_ids.append(chat_id)
+                await update.message.reply_text(
+                    "👋 Всем привет! Я бот @Game_Boar_bot.\n\n"
+                    "Я буду присылать сюда ежедневные уведомления о значимых игровых релизах."
+                )
+            return # Выходим, чтобы не делать лишних действий
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Registers a private chat for notifications (for DMs only now)."""
     chat = update.effective_chat
-    bot_username = context.bot.username
-    if chat.type in [chat.GROUP, chat.SUPERGROUP]:
-        if not update.message.text.startswith(f"@{bot_username}"):
-            return
+    if chat.type != chat.PRIVATE:
+        await update.message.reply_text(
+            "В группах подписка происходит автоматически при добавлении бота. "
+            "Эта команда нужна только для личных сообщений."
+        )
+        return
+
     chat_id = chat.id
     chat_ids = context.bot_data.setdefault("chat_ids", [])
     if chat_id not in chat_ids:
@@ -108,7 +135,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "✅ Ок, я запомнил этот чат и буду присылать сюда ежедневные уведомления о релизах."
         )
-        print(f"[INFO] Registered chat_id {chat_id}")
+        print(f"[INFO] Registered private chat_id {chat_id}")
     else:
         await update.message.reply_text("Этот чат уже есть в списке рассылки.")
 
@@ -121,6 +148,7 @@ async def releases_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Formatting and Sending Helpers ---
 def _format_game_message(game: dict):
+    # ... (код этой функции не меняется)
     name = game.get("name", "Без названия")
     summary = game.get("summary", "Описание отсутствует.")
     cover_data = game.get("cover")
@@ -142,8 +170,8 @@ def _format_game_message(game: dict):
         text += f"\n\n[Купить в Steam]({steam_url})"
     return text, cover_url
 
-
 async def _send_to_chat(app: Application, chat_id: int, text: str, photo_url: str | None):
+    # ... (код этой функции не меняется)
     try:
         if photo_url:
             await app.bot.send_photo(
@@ -159,6 +187,7 @@ async def _send_to_chat(app: Application, chat_id: int, text: str, photo_url: st
 
 # --- Job for JobQueue ---
 async def daily_check_job(context: ContextTypes.DEFAULT_TYPE):
+    # ... (код этой функции не меняется)
     print(f"[{datetime.now().isoformat()}] Running scheduled daily_check_job")
     chat_ids = context.bot_data.get("chat_ids", [])
     if not chat_ids:
@@ -178,11 +207,20 @@ def build_and_run():
         .persistence(persistence)
         .build()
     )
-    application.add_handler(CommandHandler("start", start_command, filters.COMMAND))
+
+    # --- РЕГИСТРАЦИЯ ОБРАБОТЧИКОВ ---
+    # 1. Обработчик для команды /start (теперь в основном для личных сообщений)
+    application.add_handler(CommandHandler("start", start_command))
+    # 2. Обработчик для команды /releases
     application.add_handler(CommandHandler("releases", releases_command))
+    # 3. НОВЫЙ обработчик, который срабатывает при добавлении бота в группу
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, new_member_handler))
+
+    # Schedule daily job
     tz = ZoneInfo("Europe/Amsterdam")
     scheduled_time = time(hour=10, minute=0, tzinfo=tz)
     application.job_queue.run_daily(daily_check_job, scheduled_time, name="daily_game_check")
+
     print("[INFO] Starting bot (run_polling). Registered handlers and jobs.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
