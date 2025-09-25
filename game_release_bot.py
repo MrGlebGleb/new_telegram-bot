@@ -81,7 +81,7 @@ def _format_game_message(game: dict):
     platforms_data = game.get("platforms", [])
     platforms = ", ".join([p["name"] for p in platforms_data if "name" in p])
     steam_url = next((site.get("url") for site in game.get("websites", []) if site.get("category") == 13), None)
-    text = f"🎮 *ВЫШЛА ИГРА: {name}*\n\n"
+    text = f"🎮 *Сегодня выходит: {name}*\n\n"
     if platforms: text += f"*Платформы:* {platforms}\n\n"
     text += summary
     if steam_url: text += f"\n\n[Купить в Steam]({steam_url})"
