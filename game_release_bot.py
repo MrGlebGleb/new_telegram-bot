@@ -51,8 +51,9 @@ def _get_todays_games_blocking(access_token):
     """Получает список сегодняшних релизов (блокирующая функция)."""
     today_ts = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     headers = {"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {access_token}"}
+    # ИЗМЕНЕНИЕ: Добавляем поля для рейтинга
     body = (
-        "fields name, summary, cover.url, platforms.name, websites.category, websites.url;"
+        "fields name, summary, cover.url, platforms.name, websites.category, websites.url, aggregated_rating, aggregated_rating_count;"
         f"where first_release_date >= {today_ts} & first_release_date < {today_ts + 86400}"
         " & hypes > 2;"
         "sort hypes desc; limit 10;"
@@ -72,6 +73,14 @@ def _parse_trailer(websites_data: list | None) -> str | None:
             return site.get("url")
     return None
 
+def _get_rating_emoji(rating: float | None) -> str:
+    """Возвращает цветной эмодзи в зависимости от оценки."""
+    if rating is None: return ""
+    if rating >= 75: return "🟢"
+    if rating >= 50: return "🟡"
+    if rating > 0: return "🔴"
+    return ""
+
 # --- ФОРМАТИРОВАНИЕ И ПАГИНАЦИЯ ---
 
 async def format_game_for_pagination(game_data: dict, current_index: int, total_count: int, list_id: str):
@@ -82,21 +91,26 @@ async def format_game_for_pagination(game_data: dict, current_index: int, total_
     platforms_data = game_data.get("platforms", [])
     platforms = ", ".join([p["name"] for p in platforms_data if "name" in p])
     trailer_url = game_data.get("trailer_url")
+    rating = game_data.get("aggregated_rating")
 
     text = f"🎮 *Сегодня выходит: {name}*\n\n"
+    
+    # ИЗМЕНЕНИЕ: Добавляем строку с рейтингом, если он есть
+    if rating:
+        emoji = _get_rating_emoji(rating)
+        text += f"{emoji} *Рейтинг Metacritic:* {rating:.0f}/100\n"
+
     if platforms: text += f"*Платформы:* {platforms}\n\n"
     text += summary
     
     keyboard = []
     nav_buttons = []
     if current_index > 0:
-        # ИЗМЕНЕНИЕ: Добавляем направление в callback_data
         nav_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"page_back_{list_id}_{current_index - 1}"))
     
     nav_buttons.append(InlineKeyboardButton(f"[{current_index + 1}/{total_count}]", callback_data="noop"))
     
     if current_index < total_count - 1:
-        # ИЗМЕНЕНИЕ: Добавляем направление в callback_data
         nav_buttons.append(InlineKeyboardButton("➡️ Вперед", callback_data=f"page_fwd_{list_id}_{current_index + 1}"))
     
     keyboard.append(nav_buttons)
@@ -120,7 +134,6 @@ async def _enrich_game_data_async(game: dict) -> dict:
     if not cover_data or not cover_data.get("url"):
         print(f"[INFO] Для игры '{game_name}' не найдена обложка, используется плейсхолдер.")
         encoded_name = urllib.parse.quote(game_name)
-        # ИЗМЕНЕНИЕ: Используем более надежный сервис-плейсхолдер
         final_cover_url = f"https://via.placeholder.com/1280x720.png/2F3136/FFFFFF?text={encoded_name}"
     else:
         cover_url = "https:" + cover_data["url"].replace("t_thumb", "t_720p")
@@ -171,7 +184,6 @@ async def releases_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         list_id = str(uuid.uuid4())
         context.bot_data.setdefault('game_lists', {})[list_id] = enriched_games
         
-        # ИЗМЕНЕНИЕ: Попытка отправить первую ДОСТУПНУЮ игру
         message_sent = False
         for i, game_data in enumerate(enriched_games):
             text, cover, markup = await format_game_for_pagination(
@@ -183,10 +195,10 @@ async def releases_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_photo(chat_id, photo=cover, caption=text, parse_mode=constants.ParseMode.MARKDOWN, reply_markup=markup)
                 message_sent = True
-                break # Успешно отправлено, выходим из цикла
+                break
             except Exception as e:
                 print(f"[WARN] Не удалось отправить стартовое фото для '{game_data.get('name')}': {e}")
-                continue # Пробуем следующую игру
+                continue
         
         if not message_sent:
             await context.bot.send_message(chat_id, text="🎮 На сегодня есть релизы, но не удалось загрузить для них обложки.")
@@ -201,7 +213,6 @@ async def pagination_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
 
     try:
-        # ИЗМЕНЕНИЕ: Парсим направление fwd/back
         _, direction, list_id, requested_index_str = query.data.split("_")
         current_index = int(requested_index_str)
         step = 1 if direction == "fwd" else -1
@@ -214,7 +225,6 @@ async def pagination_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("Ошибка: список устарел. Запросите заново: /releases.")
         return
         
-    # ИЗМЕНЕНИЕ: Цикл для пропуска неработающих обложек
     while 0 <= current_index < len(games):
         game_data = games[current_index]
         
@@ -228,12 +238,12 @@ async def pagination_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         try:
             media = InputMediaPhoto(media=cover, caption=text, parse_mode=constants.ParseMode.MARKDOWN)
             await query.edit_message_media(media=media, reply_markup=markup)
-            return  # Успех, выходим
+            return
         except Exception as e:
             error_text = str(e).lower()
             if "wrong type of the web page content" in error_text or "failed to get http url content" in error_text:
                 print(f"[WARN] Пропуск '{game_data.get('name')}' (индекс {current_index}) из-за битой обложки.")
-                current_index += step # Двигаемся в заданном направлении
+                current_index += step
                 continue
             else:
                 print(f"[ERROR] Непредвиденная ошибка при пагинации: {e}")
@@ -273,7 +283,6 @@ async def daily_check_job(context: ContextTypes.DEFAULT_TYPE):
             list_id = str(uuid.uuid4())
             context.bot_data.setdefault('game_lists', {})[list_id] = enriched_games
             
-            # Логика отправки с пропуском, аналогичная releases_command
             message_sent = False
             for i, game_data in enumerate(enriched_games):
                 text, cover, markup = await format_game_for_pagination(
@@ -294,7 +303,6 @@ async def daily_check_job(context: ContextTypes.DEFAULT_TYPE):
             if not message_sent:
                 print(f"[WARN] Daily send: Не удалось отправить ни одной игры в чат {chat_id}")
 
-
     except Exception as e:
         print(f"[ERROR] Сбой в ежедневной задаче: {e}")
 
@@ -312,7 +320,6 @@ def main():
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("releases", releases_command))
-    # ИЗМЕНЕНИЕ: Обновляем паттерн для обработчика кнопок
     application.add_handler(CallbackQueryHandler(pagination_handler, pattern="^page_(fwd|back)_"))
     application.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^noop$"))
 
