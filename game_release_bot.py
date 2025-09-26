@@ -75,7 +75,7 @@ def _get_todays_games_blocking(access_token):
         "fields name, summary, cover.url, platforms.name, websites.category, websites.url, aggregated_rating, aggregated_rating_count;"
         f"where first_release_date >= {today_ts} & first_release_date < {today_ts + 86400}"
         " & hypes > 2;"
-        "sort hypes desc; limit 5;" # ИЗМЕНЕНИЕ: Лимит уменьшен до 5
+        "sort hypes desc; limit 5;" # Лимит уменьшен до 5
     )
     r = requests.post("https://api.igdb.com/v4/games", headers=headers, data=body, timeout=20)
     r.raise_for_status()
@@ -146,14 +146,13 @@ async def format_game_for_pagination(game_data: dict, current_index: int, total_
 async def _enrich_game_data_async(game: dict) -> dict:
     """
     Асинхронно переводит описание и обогащает данные одной игры.
-    ИЗМЕНЕНИЕ: Включает агрессивный ретрай и подбор разрешений для обложки.
+    Включает агрессивный ретрай и подбор разрешений для обложки.
     """
     game_name = game.get("name", "No Title")
     final_cover_url: str = None
     
-    # Всегда генерируем URL плейсхолдера
-    encoded_name = urllib.parse.quote(game_name)
-    placeholder_url = f"https://via.placeholder.com/1280x720.png/2F3136/FFFFFF?text={encoded_name}"
+    # ИЗМЕНЕНИЕ: Статический URL плейсхолдера для повышения надежности кэширования Telegram
+    placeholder_url = "https://via.placeholder.com/1280x720.png/2F3136/FFFFFF?text=NO+COVER"
 
 
     cover_data = game.get("cover")
@@ -289,8 +288,7 @@ async def releases_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def pagination_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Обработчик кнопок пагинации.
-    ИЗМЕНЕНИЕ: Теперь использует 'edit_message_caption' и 'edit_message_media' 
-    и автоматически переключается на плейсхолдер, если обложка не грузится.
+    ИЗМЕНЕНИЕ: Включает ультимативный текстовый фолбэк при сбое обновления медиа.
     """
     query = update.callback_query
     await query.answer()
@@ -330,20 +328,14 @@ async def pagination_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
         except Exception as e:
             error_text = str(e).lower()
-            # Учитываем, что, возможно, фото было загружено в кэш Telegram при отправке,
-            # но при пагинации по URL возникла сетевая ошибка
             if "wrong type of the web page content" in error_text or "failed to get http url content" in error_text:
                 print(f"[WARN] Не удалось обновить фото для '{game_data.get('name')}' (индекс {current_index}). Попытка использовать плейсхолдер.")
                 # Ошибка при загрузке обложки, переходим к шагу 2
             else:
                 print(f"[ERROR] Непредвиденная ошибка при пагинации (фото): {e}")
-                await query.edit_message_caption(
-                    caption=text + "\n\nПроизошла ошибка при обновлении фото. Попробуйте запросить список заново: /releases",
-                    reply_markup=markup
-                )
-                return
+                # Если ошибка не связана с загрузкой обложки, переходим к шагу 3
     
-    # 2. Использование ПЛЕЙСХОЛДЕРА
+    # 2. Использование СТАТИЧЕСКОГО ПЛЕЙСХОЛДЕРА
     try:
         placeholder_caption = text + "\n\n*(Обложка недоступна)*"
         media = InputMediaPhoto(media=placeholder, caption=placeholder_caption, parse_mode=constants.ParseMode.MARKDOWN)
@@ -351,11 +343,16 @@ async def pagination_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     except Exception as e:
         print(f"[ERROR] Непредвиденная ошибка при пагинации (плейсхолдер): {e}")
-        # Если не удалось обновить даже с плейсхолдером, просто редактируем текст.
-        await query.edit_message_caption(
-            caption=text + "\n\n*(Обложка недоступна. Ошибка обновления сообщения.)*",
-            reply_markup=markup
-        )
+        
+        # 3. УЛЬТИМАТИВНЫЙ ФОЛБЭК: Редактируем только текст и кнопки. Медиа остается как есть.
+        final_caption = text + "\n\n*(Обложка недоступна. Ошибка обновления сообщения.)*"
+        try:
+             await query.edit_message_caption(caption=final_caption, parse_mode=constants.ParseMode.MARKDOWN, reply_markup=markup)
+             print(f"[INFO] Успешное обновление только текста для '{game_data.get('name')}' (индекс {current_index}).")
+        except Exception as edit_caption_e:
+             # Если и редактирование текста не сработало (например, сообщение слишком старое)
+             print(f"[ERROR] Сбой даже при редактировании текста: {edit_caption_e}")
+             await query.answer("Не удалось обновить сообщение. Запросите /releases заново.", show_alert=True)
         return
     
 # --- ЕЖЕДНЕВНАЯ ЗАДАЧА (аналогично releases_command) ---
