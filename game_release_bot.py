@@ -7,6 +7,7 @@ import os
 import requests
 import asyncio
 import uuid
+import urllib.parse
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 from telegram import constants, Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
@@ -50,11 +51,10 @@ def _get_todays_games_blocking(access_token):
     """Получает список сегодняшних релизов (блокирующая функция)."""
     today_ts = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     headers = {"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {access_token}"}
-    # Запрашиваем все необходимые поля, включая вебсайты для поиска трейлера
     body = (
         "fields name, summary, cover.url, platforms.name, websites.category, websites.url;"
         f"where first_release_date >= {today_ts} & first_release_date < {today_ts + 86400}"
-        " & cover != null & hypes > 2;"
+        " & hypes > 2;" # Убрали проверку "cover != null", чтобы получать все игры
         "sort hypes desc; limit 10;"
     )
     r = requests.post("https://api.igdb.com/v4/games", headers=headers, data=body, timeout=20)
@@ -68,8 +68,7 @@ def _parse_trailer(websites_data: list | None) -> str | None:
     if not websites_data:
         return None
     for site in websites_data:
-        # Категория 9 в IGDB API - это YouTube
-        if site.get("category") == 9:
+        if site.get("category") == 9: # Категория 9 в IGDB API - это YouTube
             return site.get("url")
     return None
 
@@ -107,35 +106,32 @@ async def format_game_for_pagination(game_data: dict, current_index: int, total_
 
 # --- АСИНХРОННАЯ ОБРАБОТКА ИГР ---
 
-async def _enrich_game_data_async(game: dict) -> dict | None:
+async def _enrich_game_data_async(game: dict) -> dict:
     """
     Асинхронно переводит описание и обогащает данные одной игры.
-    Возвращает None в случае ошибки или отсутствия ключевых данных (например, обложки).
+    Если обложка отсутствует, генерирует URL-заглушку.
     """
-    try:
-        # Безопасное получение URL обложки
-        cover_data = game.get("cover")
-        if not cover_data or not cover_data.get("url"):
-            print(f"[WARN] Пропуск игры ID {game.get('id', 'N/A')} из-за отсутствия URL обложки.")
-            return None
-        # ИЗМЕНЕНИЕ: Используем более надежное разрешение 720p вместо 1080p
+    game_name = game.get("name", "No Title")
+    final_cover_url: str
+
+    cover_data = game.get("cover")
+    if not cover_data or not cover_data.get("url"):
+        print(f"[INFO] Для игры '{game_name}' не найдена обложка, используется плейсхолдер.")
+        encoded_name = urllib.parse.quote(game_name)
+        final_cover_url = f"https://placehold.co/1280x720/2F3136/FFFFFF?text={encoded_name}\\n(Cover Not Found)"
+    else:
         cover_url = "https:" + cover_data["url"].replace("t_thumb", "t_720p")
-        
-        # ИЗМЕНЕНИЕ: Добавляем параметр для обхода кэша Telegram
         cache_buster = uuid.uuid4().hex[:6]
         final_cover_url = f"{cover_url}?v={cache_buster}"
 
-        summary_ru = await asyncio.to_thread(translate_text_blocking, game.get("summary", ""))
+    summary_ru = await asyncio.to_thread(translate_text_blocking, game.get("summary", ""))
 
-        return {
-            **game,
-            "summary": summary_ru,
-            "trailer_url": _parse_trailer(game.get("websites")),
-            "cover_url": final_cover_url # Используем URL с cache buster
-        }
-    except Exception as e:
-        print(f"[WARN] Не удалось обработать игру ID {game.get('id', 'N/A')}: {e}")
-        return None
+    return {
+        **game,
+        "summary": summary_ru,
+        "trailer_url": _parse_trailer(game.get("websites")),
+        "cover_url": final_cover_url
+    }
 
 # --- КОМАНДЫ И ОБРАБОТЧИКИ ---
 
@@ -167,15 +163,7 @@ async def releases_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         tasks = [_enrich_game_data_async(game) for game in base_games]
-        results = await asyncio.gather(*tasks)
-
-        # Фильтруем игры, которые не удалось обработать
-        enriched_games = [game for game in results if game is not None]
-
-        # Проверяем, остались ли игры после фильтрации
-        if not enriched_games:
-            await context.bot.send_message(chat_id, text="🎮 Значимых релизов на сегодня не найдено или не удалось обработать данные.")
-            return
+        enriched_games = await asyncio.gather(*tasks)
             
         list_id = str(uuid.uuid4())
         context.bot_data.setdefault('game_lists', {})[list_id] = enriched_games
@@ -198,20 +186,22 @@ async def pagination_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
 
     try:
-        _, list_id, new_index_str = query.data.split("_")
-        new_index = int(new_index_str)
+        _, list_id, requested_index_str = query.data.split("_")
+        requested_index = int(requested_index_str)
     except (ValueError, IndexError):
-        await query.answer("Ошибка: неверные данные пагинации.", show_alert=True)
+        await query.edit_message_text("Ошибка: некорректные данные пагинации.")
         return
 
     games = context.bot_data.get('game_lists', {}).get(list_id)
-    if not games or not (0 <= new_index < len(games)):
+    if not games or not (0 <= requested_index < len(games)):
         await query.edit_message_text("Ошибка: список устарел. Запросите заново: /releases.")
         return
         
+    game_data = games[requested_index]
+    
     text, cover, markup = await format_game_for_pagination(
-        game_data=games[new_index],
-        current_index=new_index,
+        game_data=game_data,
+        current_index=requested_index,
         total_count=len(games),
         list_id=list_id
     )
@@ -221,14 +211,7 @@ async def pagination_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_media(media=media, reply_markup=markup)
     except Exception as e:
         print(f"[WARN] Не удалось изменить медиа сообщения: {e}")
-        # ИЗМЕНЕНИЕ: Добавляем уведомление для пользователя в случае ошибки
-        if "Wrong type of the web page content" in str(e):
-            await query.answer(
-                "Не удалось загрузить обложку для этой игры. Возможно, она повреждена.",
-                show_alert=False # Показываем короткое всплывающее уведомление
-            )
-        else:
-            await query.answer("Произошла ошибка при переключении.", show_alert=True)
+        await query.answer("Не удалось обновить информацию. Попробуйте еще раз.", show_alert=True)
 
 
 async def daily_check_job(context: ContextTypes.DEFAULT_TYPE):
@@ -247,14 +230,10 @@ async def daily_check_job(context: ContextTypes.DEFAULT_TYPE):
             return
 
         tasks = [_enrich_game_data_async(game) for game in base_games]
-        results = await asyncio.gather(*tasks)
-
-        # Фильтруем игры, которые не удалось обработать
-        enriched_games = [game for game in results if game is not None]
+        enriched_games = await asyncio.gather(*tasks)
         
-        # Проверяем, остались ли игры после фильтрации
         if not enriched_games:
-            print("[INFO] Релизов на сегодня нет после фильтрации.")
+            print("[INFO] Релизов на сегодня нет после обработки.")
             return
 
         print(f"[INFO] Отправка ежедневных релизов в {len(chat_ids)} чатов.")
@@ -270,7 +249,7 @@ async def daily_check_job(context: ContextTypes.DEFAULT_TYPE):
             )
             try:
                 await context.bot.send_photo(chat_id, photo=cover, caption=text, parse_mode=constants.ParseMode.MARKDOWN, reply_markup=markup)
-                await asyncio.sleep(0.5) # Задержка между отправками в разные чаты
+                await asyncio.sleep(0.5)
             except Exception as e:
                 print(f"[WARN] Не удалось отправить сообщение в чат {chat_id}: {e}")
 
@@ -289,16 +268,12 @@ def main():
         .build()
     )
 
-    # Регистрация команд
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("releases", releases_command))
-
-    # Регистрация обработчиков кнопок
     application.add_handler(CallbackQueryHandler(pagination_handler, pattern="^page_"))
     application.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^noop$"))
 
-    # Настройка ежедневной задачи
-    tz = ZoneInfo("Europe/Moscow") # Вы можете поменять на свой часовой пояс
+    tz = ZoneInfo("Europe/Moscow")
     scheduled_time = time(hour=11, minute=0, tzinfo=tz)
     application.job_queue.run_daily(daily_check_job, scheduled_time, name="daily_game_check")
 
@@ -308,5 +283,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
