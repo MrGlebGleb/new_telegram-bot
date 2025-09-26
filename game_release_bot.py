@@ -146,10 +146,10 @@ async def format_game_for_pagination(game_data: dict, current_index: int, total_
 async def _enrich_game_data_async(game: dict) -> dict:
     """
     Асинхронно переводит описание и обогащает данные одной игры.
-    Если обложка отсутствует, генерирует URL-заглушку.
+    ИЗМЕНЕНИЕ: Включает агрессивный ретрай и подбор разрешений для обложки.
     """
     game_name = game.get("name", "No Title")
-    final_cover_url: str
+    final_cover_url: str = None
     
     # Всегда генерируем URL плейсхолдера
     encoded_name = urllib.parse.quote(game_name)
@@ -157,20 +157,38 @@ async def _enrich_game_data_async(game: dict) -> dict:
 
 
     cover_data = game.get("cover")
-    if not cover_data or not cover_data.get("url"):
-        print(f"[INFO] Для игры '{game_name}' не найдена обложка.")
-        final_cover_url = None # Нет обложки
-    else:
-        # Меняем размер и добавляем "cache buster" для предотвращения проблем с кэшем Telegram
-        cover_url = "https:" + cover_data["url"].replace("t_thumb", "t_720p")
-        cache_buster = uuid.uuid4().hex[:6]
-        final_cover_url = f"{cover_url}?v={cache_buster}"
+    if cover_data and cover_data.get("url"):
+        base_url = "https:" + cover_data["url"]
+        # Список разрешений для подбора. Начинаем с самого высокого.
+        resolutions = ["t_720p", "t_hd", "t_screenshot_med"]
+        max_retries = 3
 
-        # ИЗМЕНЕНИЕ: Асинхронно проверяем доступность обложки перед сохранением
-        is_available = await asyncio.to_thread(_check_url_blocking, final_cover_url)
-        if not is_available:
-            print(f"[WARN] Обложка по URL '{final_cover_url}' недоступна по прямому запросу. Используется плейсхолдер.")
-            final_cover_url = None # Принудительно используем плейсхолдер
+        for res in resolutions:
+            cover_url_attempt = base_url.replace("t_thumb", res)
+            
+            # Внутренний цикл для повторных попыток
+            for attempt in range(max_retries):
+                cache_buster = uuid.uuid4().hex[:6]
+                url_with_buster = f"{cover_url_attempt}?v={cache_buster}"
+                
+                # Асинхронно проверяем доступность обложки
+                is_available = await asyncio.to_thread(_check_url_blocking, url_with_buster)
+                
+                if is_available:
+                    final_cover_url = url_with_buster
+                    print(f"[INFO] Обложка для '{game_name}' успешно проверена на разрешении: {res} (попытка {attempt + 1}).")
+                    break # Успех, выходим из внутреннего цикла ретраев
+                
+                if attempt < max_retries - 1:
+                    print(f"[WARN] Попытка {attempt + 1}/{max_retries} не удалась для '{game_name}' ({res}). Пауза 1с.")
+                    await asyncio.sleep(1) # Ждем перед повторной попыткой
+            
+            if final_cover_url:
+                break # Успех, выходим из внешнего цикла разрешений
+
+    if not final_cover_url:
+         print(f"[WARN] Обложка для '{game_name}' недоступна ни в одном разрешении после всех попыток. Используется плейсхолдер.")
+
 
     # Асинхронно переводим текст
     summary_ru = await asyncio.to_thread(translate_text_blocking, game.get("summary", ""))
