@@ -40,6 +40,22 @@ def translate_text_blocking(text: str) -> str:
         print(f"[ERROR] Ошибка библиотеки translators: {e}")
         return text
 
+def _check_url_blocking(url: str) -> bool:
+    """
+    Блокирующая функция. Проверяет доступность URL обложки 
+    с помощью HEAD-запроса перед отправкой в Telegram.
+    """
+    if not url: return False
+    try:
+        # Используем HEAD, чтобы не скачивать все тело изображения
+        r = requests.head(url, timeout=5)
+        # Успешный статус (200-399)
+        return 200 <= r.status_code < 400
+    except requests.exceptions.RequestException as e:
+        # Ошибка таймаута, подключения или DNS
+        print(f"[WARN] Head check failed for {url}: {e}")
+        return False
+
 def _get_igdb_access_token_blocking():
     """Получает токен доступа от Twitch/IGDB."""
     url = (f"https://id.twitch.tv/oauth2/token?client_id={TWITCH_CLIENT_ID}"
@@ -59,7 +75,7 @@ def _get_todays_games_blocking(access_token):
         "fields name, summary, cover.url, platforms.name, websites.category, websites.url, aggregated_rating, aggregated_rating_count;"
         f"where first_release_date >= {today_ts} & first_release_date < {today_ts + 86400}"
         " & hypes > 2;"
-        "sort hypes desc; limit 10;"
+        "sort hypes desc; limit 5;" # ИЗМЕНЕНИЕ: Лимит уменьшен до 5
     )
     r = requests.post("https://api.igdb.com/v4/games", headers=headers, data=body, timeout=20)
     r.raise_for_status()
@@ -142,13 +158,19 @@ async def _enrich_game_data_async(game: dict) -> dict:
 
     cover_data = game.get("cover")
     if not cover_data or not cover_data.get("url"):
-        print(f"[INFO] Для игры '{game_name}' не найдена обложка, используется плейсхолдер.")
-        final_cover_url = None # Нет обложки, оставляем cover_url пустым
+        print(f"[INFO] Для игры '{game_name}' не найдена обложка.")
+        final_cover_url = None # Нет обложки
     else:
         # Меняем размер и добавляем "cache buster" для предотвращения проблем с кэшем Telegram
         cover_url = "https:" + cover_data["url"].replace("t_thumb", "t_720p")
         cache_buster = uuid.uuid4().hex[:6]
         final_cover_url = f"{cover_url}?v={cache_buster}"
+
+        # ИЗМЕНЕНИЕ: Асинхронно проверяем доступность обложки перед сохранением
+        is_available = await asyncio.to_thread(_check_url_blocking, final_cover_url)
+        if not is_available:
+            print(f"[WARN] Обложка по URL '{final_cover_url}' недоступна по прямому запросу. Используется плейсхолдер.")
+            final_cover_url = None # Принудительно используем плейсхолдер
 
     # Асинхронно переводим текст
     summary_ru = await asyncio.to_thread(translate_text_blocking, game.get("summary", ""))
@@ -290,6 +312,8 @@ async def pagination_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
         except Exception as e:
             error_text = str(e).lower()
+            # Учитываем, что, возможно, фото было загружено в кэш Telegram при отправке,
+            # но при пагинации по URL возникла сетевая ошибка
             if "wrong type of the web page content" in error_text or "failed to get http url content" in error_text:
                 print(f"[WARN] Не удалось обновить фото для '{game_data.get('name')}' (индекс {current_index}). Попытка использовать плейсхолдер.")
                 # Ошибка при загрузке обложки, переходим к шагу 2
