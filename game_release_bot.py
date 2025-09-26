@@ -107,17 +107,30 @@ async def format_game_for_pagination(game_data: dict, current_index: int, total_
 
 # --- АСИНХРОННАЯ ОБРАБОТКА ИГР ---
 
-async def _enrich_game_data_async(game: dict) -> dict:
-    """Асинхронно переводит описание и обогащает данные одной игры."""
-    summary_ru = await asyncio.to_thread(translate_text_blocking, game.get("summary", ""))
-    cover_url = "https:" + game["cover"]["url"].replace("t_thumb", "t_1080p") if game.get("cover") else None
+async def _enrich_game_data_async(game: dict) -> dict | None:
+    """
+    Асинхронно переводит описание и обогащает данные одной игры.
+    Возвращает None в случае ошибки или отсутствия ключевых данных (например, обложки).
+    """
+    try:
+        # Безопасное получение URL обложки
+        cover_data = game.get("cover")
+        if not cover_data or not cover_data.get("url"):
+            print(f"[WARN] Пропуск игры ID {game.get('id', 'N/A')} из-за отсутствия URL обложки.")
+            return None
+        cover_url = "https:" + cover_data["url"].replace("t_thumb", "t_1080p")
 
-    return {
-        **game,
-        "summary": summary_ru,
-        "trailer_url": _parse_trailer(game.get("websites")),
-        "cover_url": cover_url
-    }
+        summary_ru = await asyncio.to_thread(translate_text_blocking, game.get("summary", ""))
+
+        return {
+            **game,
+            "summary": summary_ru,
+            "trailer_url": _parse_trailer(game.get("websites")),
+            "cover_url": cover_url
+        }
+    except Exception as e:
+        print(f"[WARN] Не удалось обработать игру ID {game.get('id', 'N/A')}: {e}")
+        return None
 
 # --- КОМАНДЫ И ОБРАБОТЧИКИ ---
 
@@ -149,7 +162,15 @@ async def releases_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         tasks = [_enrich_game_data_async(game) for game in base_games]
-        enriched_games = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks)
+
+        # Фильтруем игры, которые не удалось обработать
+        enriched_games = [game for game in results if game is not None]
+
+        # Проверяем, остались ли игры после фильтрации
+        if not enriched_games:
+            await context.bot.send_message(chat_id, text="🎮 Значимых релизов на сегодня не найдено или не удалось обработать данные.")
+            return
             
         list_id = str(uuid.uuid4())
         context.bot_data.setdefault('game_lists', {})[list_id] = enriched_games
@@ -213,7 +234,15 @@ async def daily_check_job(context: ContextTypes.DEFAULT_TYPE):
             return
 
         tasks = [_enrich_game_data_async(game) for game in base_games]
-        enriched_games = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks)
+
+        # Фильтруем игры, которые не удалось обработать
+        enriched_games = [game for game in results if game is not None]
+        
+        # Проверяем, остались ли игры после фильтрации
+        if not enriched_games:
+            print("[INFO] Релизов на сегодня нет после фильтрации.")
+            return
 
         print(f"[INFO] Отправка ежедневных релизов в {len(chat_ids)} чатов.")
         for chat_id in chat_ids:
