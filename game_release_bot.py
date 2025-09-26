@@ -34,7 +34,8 @@ def translate_text_blocking(text: str) -> str:
     """Блокирующая функция для перевода текста."""
     if not text: return ""
     try:
-        return ts.translate_text(text, translator='google', to_language='ru')
+        # Увеличиваем таймаут, так как перевод может быть медленным
+        return ts.translate_text(text, translator='google', to_language='ru', timeout=10)
     except Exception as e:
         print(f"[ERROR] Ошибка библиотеки translators: {e}")
         return text
@@ -49,10 +50,12 @@ def _get_igdb_access_token_blocking():
 
 def _get_todays_games_blocking(access_token):
     """Получает список сегодняшних релизов (блокирующая функция)."""
+    # Учитываем, что IGDB хранит даты в UTC. Если нужно точно по Москве, можно скорректировать.
     today_ts = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    
     headers = {"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {access_token}"}
-    # ИЗМЕНЕНИЕ: Добавляем поля для рейтинга
     body = (
+        # Добавляем больше полей, чтобы не делать лишних запросов.
         "fields name, summary, cover.url, platforms.name, websites.category, websites.url, aggregated_rating, aggregated_rating_count;"
         f"where first_release_date >= {today_ts} & first_release_date < {today_ts + 86400}"
         " & hypes > 2;"
@@ -87,7 +90,10 @@ async def format_game_for_pagination(game_data: dict, current_index: int, total_
     """Форматирует сообщение с информацией об игре для отправки пользователю."""
     name = game_data.get("name", "Без названия")
     summary = game_data.get("summary", "Описание отсутствует.")
+    # Используем 'cover_url' для фото, 'placeholder_url' для заглушки (если обложка не загрузится)
     cover_url = game_data.get("cover_url")
+    placeholder_url = game_data.get("placeholder_url")
+
     platforms_data = game_data.get("platforms", [])
     platforms = ", ".join([p["name"] for p in platforms_data if "name" in p])
     trailer_url = game_data.get("trailer_url")
@@ -95,7 +101,6 @@ async def format_game_for_pagination(game_data: dict, current_index: int, total_
 
     text = f"🎮 *Сегодня выходит: {name}*\n\n"
     
-    # ИЗМЕНЕНИЕ: Добавляем строку с рейтингом, если он есть
     if rating:
         emoji = _get_rating_emoji(rating)
         text += f"{emoji} *Рейтинг Metacritic:* {rating:.0f}/100\n"
@@ -118,7 +123,7 @@ async def format_game_for_pagination(game_data: dict, current_index: int, total_
     if trailer_url:
         keyboard.append([InlineKeyboardButton("🎬 Смотреть трейлер", url=trailer_url)])
     
-    return text, cover_url, InlineKeyboardMarkup(keyboard)
+    return text, cover_url, placeholder_url, InlineKeyboardMarkup(keyboard)
 
 # --- АСИНХРОННАЯ ОБРАБОТКА ИГР ---
 
@@ -129,24 +134,31 @@ async def _enrich_game_data_async(game: dict) -> dict:
     """
     game_name = game.get("name", "No Title")
     final_cover_url: str
+    
+    # Всегда генерируем URL плейсхолдера
+    encoded_name = urllib.parse.quote(game_name)
+    placeholder_url = f"https://via.placeholder.com/1280x720.png/2F3136/FFFFFF?text={encoded_name}"
+
 
     cover_data = game.get("cover")
     if not cover_data or not cover_data.get("url"):
         print(f"[INFO] Для игры '{game_name}' не найдена обложка, используется плейсхолдер.")
-        encoded_name = urllib.parse.quote(game_name)
-        final_cover_url = f"https://via.placeholder.com/1280x720.png/2F3136/FFFFFF?text={encoded_name}"
+        final_cover_url = None # Нет обложки, оставляем cover_url пустым
     else:
+        # Меняем размер и добавляем "cache buster" для предотвращения проблем с кэшем Telegram
         cover_url = "https:" + cover_data["url"].replace("t_thumb", "t_720p")
         cache_buster = uuid.uuid4().hex[:6]
         final_cover_url = f"{cover_url}?v={cache_buster}"
 
+    # Асинхронно переводим текст
     summary_ru = await asyncio.to_thread(translate_text_blocking, game.get("summary", ""))
 
     return {
         **game,
         "summary": summary_ru,
         "trailer_url": _parse_trailer(game.get("websites")),
-        "cover_url": final_cover_url
+        "cover_url": final_cover_url, # Может быть None, если нет обложки
+        "placeholder_url": placeholder_url # Всегда есть URL плейсхолдера
     }
 
 # --- КОМАНДЫ И ОБРАБОТЧИКИ ---
@@ -168,9 +180,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def releases_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Основная команда для получения релизов с пагинацией."""
     chat_id = update.effective_chat.id
+    # Удаляем предыдущие сообщения "Ищу..."
     await update.message.reply_text("🔍 Ищу и обрабатываю сегодняшние релизы... Это может занять несколько секунд.")
     
     try:
+        # Увеличиваем лимит, чтобы получить больше игр, если некоторые не пройдут
         access_token = await asyncio.to_thread(_get_igdb_access_token_blocking)
         base_games = await asyncio.to_thread(_get_todays_games_blocking, access_token)
         
@@ -182,59 +196,94 @@ async def releases_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         enriched_games = await asyncio.gather(*tasks)
             
         list_id = str(uuid.uuid4())
+        # Сохраняем ТОЛЬКО ОБОГАЩЕННЫЕ игры. Важный момент: не пропускаем игры на этом этапе.
         context.bot_data.setdefault('game_lists', {})[list_id] = enriched_games
         
-        message_sent = False
-        for i, game_data in enumerate(enriched_games):
-            text, cover, markup = await format_game_for_pagination(
-                game_data=game_data,
-                current_index=i,
-                total_count=len(enriched_games),
-                list_id=list_id
-            )
-            try:
-                await context.bot.send_photo(chat_id, photo=cover, caption=text, parse_mode=constants.ParseMode.MARKDOWN, reply_markup=markup)
-                message_sent = True
-                break
-            except Exception as e:
-                print(f"[WARN] Не удалось отправить стартовое фото для '{game_data.get('name')}': {e}")
-                continue
+        # Находим первую игру, которую можно отправить
+        first_game_index = 0
+        current_game_data = enriched_games[first_game_index]
+
+        text, cover, placeholder, markup = await format_game_for_pagination(
+            game_data=current_game_data,
+            current_index=first_game_index,
+            total_count=len(enriched_games),
+            list_id=list_id
+        )
         
-        if not message_sent:
-            await context.bot.send_message(chat_id, text="🎮 На сегодня есть релизы, но не удалось загрузить для них обложки.")
+        # ИЗМЕНЕНИЕ: Отправляем первую игру, пытаясь использовать фото, но в случае ошибки - отправляем текстовое сообщение
+        try:
+            # 1. Попытка отправить с обложкой
+            if cover:
+                await context.bot.send_photo(
+                    chat_id, 
+                    photo=cover, 
+                    caption=text, 
+                    parse_mode=constants.ParseMode.MARKDOWN, 
+                    reply_markup=markup
+                )
+            else:
+                # 2. Если обложки нет, отправляем с плейсхолдером
+                await context.bot.send_photo(
+                    chat_id, 
+                    photo=placeholder, 
+                    caption=text + "\n\n*(Не удалось загрузить обложку)*", 
+                    parse_mode=constants.ParseMode.MARKDOWN, 
+                    reply_markup=markup
+                )
+        except Exception as e:
+            # 3. Если даже с плейсхолдером не удалось (например, проблема с Telegram или chat_id), 
+            # отправляем чисто текстовое сообщение БЕЗ ФОТО. Игра не пропускается!
+            print(f"[WARN] Не удалось отправить фото/плейсхолдер для '{current_game_data.get('name')}'. Отправка текста. Ошибка: {e}")
+            await context.bot.send_message(
+                chat_id, 
+                text=text + "\n\n*(Обложка недоступна)*", 
+                parse_mode=constants.ParseMode.MARKDOWN, 
+                reply_markup=markup
+            )
+
 
     except Exception as e:
         print(f"[ERROR] Ошибка в команде releases_command: {e}")
         await context.bot.send_message(chat_id, text="Произошла критическая ошибка при получении данных.")
 
 async def pagination_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопок пагинации с автоматическим пропуском 'битых' обложек."""
+    """
+    Обработчик кнопок пагинации.
+    ИЗМЕНЕНИЕ: Теперь использует 'edit_message_caption' и 'edit_message_media' 
+    и автоматически переключается на плейсхолдер, если обложка не грузится.
+    """
     query = update.callback_query
     await query.answer()
 
     try:
         _, direction, list_id, requested_index_str = query.data.split("_")
         current_index = int(requested_index_str)
-        step = 1 if direction == "fwd" else -1
     except (ValueError, IndexError):
-        await query.edit_message_text("Ошибка: некорректные данные пагинации.")
+        # Используем edit_message_caption, так как это сообщение с фото
+        await query.edit_message_caption(caption="Ошибка: некорректные данные пагинации.")
         return
 
     games = context.bot_data.get('game_lists', {}).get(list_id)
     if not games:
-        await query.edit_message_text("Ошибка: список устарел. Запросите заново: /releases.")
+        await query.edit_message_caption(caption="Ошибка: список устарел. Запросите заново: /releases.")
         return
-        
-    while 0 <= current_index < len(games):
-        game_data = games[current_index]
-        
-        text, cover, markup = await format_game_for_pagination(
-            game_data=game_data,
-            current_index=current_index,
-            total_count=len(games),
-            list_id=list_id
-        )
+    
+    if not (0 <= current_index < len(games)):
+        # Защита от выхода за пределы списка
+        await query.answer("Это конец списка!", show_alert=False)
+        return
 
+    game_data = games[current_index]
+    
+    text, cover, placeholder, markup = await format_game_for_pagination(
+        game_data=game_data,
+        current_index=current_index,
+        total_count=len(games),
+        list_id=list_id
+    )
+
+    # 1. Попытка отредактировать сообщение с ОРИГИНАЛЬНЫМ фото (если оно есть)
+    if cover:
         try:
             media = InputMediaPhoto(media=cover, caption=text, parse_mode=constants.ParseMode.MARKDOWN)
             await query.edit_message_media(media=media, reply_markup=markup)
@@ -242,19 +291,32 @@ async def pagination_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as e:
             error_text = str(e).lower()
             if "wrong type of the web page content" in error_text or "failed to get http url content" in error_text:
-                print(f"[WARN] Пропуск '{game_data.get('name')}' (индекс {current_index}) из-за битой обложки.")
-                current_index += step
-                continue
+                print(f"[WARN] Не удалось обновить фото для '{game_data.get('name')}' (индекс {current_index}). Попытка использовать плейсхолдер.")
+                # Ошибка при загрузке обложки, переходим к шагу 2
             else:
-                print(f"[ERROR] Непредвиденная ошибка при пагинации: {e}")
-                await context.bot.send_message(
-                    chat_id=query.effective_chat.id,
-                    text="Произошла неизвестная ошибка. Попробуйте запросить список заново: /releases"
+                print(f"[ERROR] Непредвиденная ошибка при пагинации (фото): {e}")
+                await query.edit_message_caption(
+                    caption=text + "\n\nПроизошла ошибка при обновлении фото. Попробуйте запросить список заново: /releases",
+                    reply_markup=markup
                 )
                 return
     
-    print("[INFO] Достигнут конец списка при пропуске 'битых' обложек.")
-
+    # 2. Использование ПЛЕЙСХОЛДЕРА
+    try:
+        placeholder_caption = text + "\n\n*(Обложка недоступна)*"
+        media = InputMediaPhoto(media=placeholder, caption=placeholder_caption, parse_mode=constants.ParseMode.MARKDOWN)
+        await query.edit_message_media(media=media, reply_markup=markup)
+        return
+    except Exception as e:
+        print(f"[ERROR] Непредвиденная ошибка при пагинации (плейсхолдер): {e}")
+        # Если не удалось обновить даже с плейсхолдером, просто редактируем текст.
+        await query.edit_message_caption(
+            caption=text + "\n\n*(Обложка недоступна. Ошибка обновления сообщения.)*",
+            reply_markup=markup
+        )
+        return
+    
+# --- ЕЖЕДНЕВНАЯ ЗАДАЧА (аналогично releases_command) ---
 
 async def daily_check_job(context: ContextTypes.DEFAULT_TYPE):
     """Ежедневная задача для рассылки релизов."""
@@ -283,25 +345,41 @@ async def daily_check_job(context: ContextTypes.DEFAULT_TYPE):
             list_id = str(uuid.uuid4())
             context.bot_data.setdefault('game_lists', {})[list_id] = enriched_games
             
-            message_sent = False
+            # ИЗМЕНЕНИЕ: Теперь отправляем ВСЕ игры по очереди, используя заглушку, если фото не грузится
             for i, game_data in enumerate(enriched_games):
-                text, cover, markup = await format_game_for_pagination(
+                text, cover, placeholder, markup = await format_game_for_pagination(
                     game_data=game_data,
                     current_index=i,
                     total_count=len(enriched_games),
                     list_id=list_id
                 )
-                try:
-                    await context.bot.send_photo(chat_id, photo=cover, caption=text, parse_mode=constants.ParseMode.MARKDOWN, reply_markup=markup)
-                    message_sent = True
-                    await asyncio.sleep(0.5)
-                    break 
-                except Exception as e:
-                    print(f"[WARN] Daily send: Не удалось отправить фото для '{game_data.get('name')}' в чат {chat_id}: {e}")
-                    continue
-            
-            if not message_sent:
-                print(f"[WARN] Daily send: Не удалось отправить ни одной игры в чат {chat_id}")
+                
+                # ИЗМЕНЕНИЕ: Отправляем игру, пытаясь использовать фото, но в случае ошибки - отправляем текстовое сообщение
+                message_sent = False
+                
+                # 1. Попытка отправить с обложкой
+                if cover:
+                    try:
+                        await context.bot.send_photo(chat_id, photo=cover, caption=text, parse_mode=constants.ParseMode.MARKDOWN, reply_markup=markup)
+                        message_sent = True
+                    except Exception as e:
+                        # Если не удалось с обложкой, печатаем предупреждение и переходим к плейсхолдеру
+                        print(f"[WARN] Daily send: Не удалось отправить фото для '{game_data.get('name')}' в чат {chat_id}. Попытка с плейсхолдером. Ошибка: {e}")
+                
+                # 2. Если не удалось с обложкой или обложки не было, пробуем отправить с плейсхолдером
+                if not message_sent:
+                    try:
+                        await context.bot.send_photo(chat_id, photo=placeholder, caption=text + "\n\n*(Не удалось загрузить обложку)*", parse_mode=constants.ParseMode.MARKDOWN, reply_markup=markup)
+                        message_sent = True
+                    except Exception as e:
+                        # 3. Если даже с плейсхолдером не удалось, отправляем чисто текстовое сообщение
+                        print(f"[ERROR] Daily send: Не удалось отправить фото/плейсхолдер для '{game_data.get('name')}' в чат {chat_id}. Отправка текста. Ошибка: {e}")
+                        await context.bot.send_message(chat_id, text=text + "\n\n*(Обложка недоступна)*", parse_mode=constants.ParseMode.MARKDOWN, reply_markup=markup)
+                        message_sent = True
+
+                if message_sent:
+                    # Задержка между отправками в чат для предотвращения флуда
+                    await asyncio.sleep(1.0) 
 
     except Exception as e:
         print(f"[ERROR] Сбой в ежедневной задаче: {e}")
@@ -310,6 +388,7 @@ async def daily_check_job(context: ContextTypes.DEFAULT_TYPE):
 # --- СБОРКА И ЗАПУСК ---
 def main():
     """Основная функция для запуска бота."""
+    # Убедитесь, что Telegram Bot API использует более высокие лимиты
     persistence = PicklePersistence(filepath="bot_data.pkl")
     application = (
         Application.builder()
@@ -320,17 +399,26 @@ def main():
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("releases", releases_command))
+    # Обновляем pattern, чтобы избежать ошибки Attribute Error при пагинации
     application.add_handler(CallbackQueryHandler(pagination_handler, pattern="^page_(fwd|back)_"))
     application.add_handler(CallbackQueryHandler(lambda u, c: u.callback_query.answer(), pattern="^noop$"))
 
+    # Добавляем JobQueue
     tz = ZoneInfo("Europe/Moscow")
     scheduled_time = time(hour=11, minute=0, tzinfo=tz)
+    
+    # Удаляем job, если он уже есть, перед добавлением, чтобы избежать дублирования после перезапуска
+    current_jobs = application.job_queue.get_jobs_by_name("daily_game_check")
+    if current_jobs:
+        for job in current_jobs:
+            job.schedule_removal()
+            
     application.job_queue.run_daily(daily_check_job, scheduled_time, name="daily_game_check")
 
     print("[INFO] Бот запускается...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Увеличиваем таймаут для polling
+    application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
 
 
 if __name__ == "__main__":
     main()
-
