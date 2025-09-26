@@ -118,7 +118,12 @@ async def _enrich_game_data_async(game: dict) -> dict | None:
         if not cover_data or not cover_data.get("url"):
             print(f"[WARN] Пропуск игры ID {game.get('id', 'N/A')} из-за отсутствия URL обложки.")
             return None
-        cover_url = "https:" + cover_data["url"].replace("t_thumb", "t_1080p")
+        # ИЗМЕНЕНИЕ: Используем более надежное разрешение 720p вместо 1080p
+        cover_url = "https:" + cover_data["url"].replace("t_thumb", "t_720p")
+        
+        # ИЗМЕНЕНИЕ: Добавляем параметр для обхода кэша Telegram
+        cache_buster = uuid.uuid4().hex[:6]
+        final_cover_url = f"{cover_url}?v={cache_buster}"
 
         summary_ru = await asyncio.to_thread(translate_text_blocking, game.get("summary", ""))
 
@@ -126,7 +131,7 @@ async def _enrich_game_data_async(game: dict) -> dict | None:
             **game,
             "summary": summary_ru,
             "trailer_url": _parse_trailer(game.get("websites")),
-            "cover_url": cover_url
+            "cover_url": final_cover_url # Используем URL с cache buster
         }
     except Exception as e:
         print(f"[WARN] Не удалось обработать игру ID {game.get('id', 'N/A')}: {e}")
@@ -196,7 +201,7 @@ async def pagination_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         _, list_id, new_index_str = query.data.split("_")
         new_index = int(new_index_str)
     except (ValueError, IndexError):
-        await query.edit_message_text("Ошибка: неверные данные пагинации.")
+        await query.answer("Ошибка: неверные данные пагинации.", show_alert=True)
         return
 
     games = context.bot_data.get('game_lists', {}).get(list_id)
@@ -216,6 +221,14 @@ async def pagination_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_media(media=media, reply_markup=markup)
     except Exception as e:
         print(f"[WARN] Не удалось изменить медиа сообщения: {e}")
+        # ИЗМЕНЕНИЕ: Добавляем уведомление для пользователя в случае ошибки
+        if "Wrong type of the web page content" in str(e):
+            await query.answer(
+                "Не удалось загрузить обложку для этой игры. Возможно, она повреждена.",
+                show_alert=False # Показываем короткое всплывающее уведомление
+            )
+        else:
+            await query.answer("Произошла ошибка при переключении.", show_alert=True)
 
 
 async def daily_check_job(context: ContextTypes.DEFAULT_TYPE):
@@ -295,4 +308,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
